@@ -503,4 +503,140 @@ negosiasi PPP, dan event IPv4. Capture berisi ringkasan paket simulasi
 terpilih, bukan perekaman semua frame. Konfigurasi mirror bersifat sementara
 dan tidak masuk ke file konfigurasi.
 
+## QinQ dua OLT melalui uplink 0/2/0
+
+Contoh berikut menghubungkan dua OLT melalui port 10GE `0/2/0` di masing-masing
+perangkat. ONT-A membawa VLAN pelanggan (C-VLAN) 10 ke OLT-A; OLT-A membawanya
+di VLAN provider (S-VLAN) 50 melalui uplink ke OLT-B. OLT-B kemudian
+menyediakan VLAN pelanggan 10 ke ONT-B.
+
+```text
+PC/ONT-A -- GPON -- OLT-A 0/2/0 ===== 0/2/0 OLT-B -- GPON -- ONT-B/PC
+          C-VLAN 10       S-VLAN 50       S-VLAN 50       C-VLAN 10
+```
+
+Di kanvas, hubungkan `Huawei_1` port `0/2/0` ke `Huawei_2` port `0/2/0`.
+Pilih modul 10GE yang sama pada kedua sisi dan kabel single-mode (SMF). Pastikan
+link menunjukkan **UP**. Uplink 10GE MA5801 ini tidak perlu auto-negotiation.
+
+### 1. Siapkan profil GPON
+
+Profil DBA, line-profile, dan service-profile dibuat satu kali dan dapat dipakai
+oleh kedua OLT di simulator:
+
+```text
+enable
+config
+dba-profile add profile-name DBA_10M type3 assure 10240 max 10240
+ont-lineprofile gpon profile-id 10
+tcont 4 dba-profile-name DBA_10M
+gem add 10 eth tcont 4
+gem mapping 10 0 vlan 10
+commit
+quit
+ont-srvprofile gpon profile-id 10
+ont-port eth adaptive
+port vlan eth 1 10
+commit
+quit
+```
+
+VLAN 10 pada GEM mapping adalah C-VLAN yang digunakan ONT. VLAN 50 yang akan
+dibuat pada langkah berikutnya adalah S-VLAN QinQ di sisi OLT.
+
+### 2. Tambahkan ONT pada kedua OLT
+
+Jalankan bagian pertama di console OLT-A dan bagian kedua di console OLT-B.
+Ganti serial number contoh dengan SN ONT yang terhubung ke perangkat Anda.
+Contoh ini menggunakan port GPON berbeda supaya identitas ONT tidak bertabrakan
+di database simulator.
+
+**OLT-A (`Huawei_1`), ONT di GPON `0/1/0`:**
+
+```text
+interface gpon 0/1
+port 0 ont-auto-find enable
+ont add 0 1 sn-auth 414C434CB46E0A86 omci ont-lineprofile-id 10 ont-srvprofile-id 10 desc QinQ-ONT-A
+quit
+```
+
+**OLT-B (`Huawei_2`), ONT di GPON `0/1/1`:**
+
+```text
+enable
+config
+interface gpon 0/1
+port 1 ont-auto-find enable
+ont add 1 1 sn-auth 414C434CB46C21FA omci ont-lineprofile-id 10 ont-srvprofile-id 10 desc QinQ-ONT-B
+quit
+```
+
+Pastikan SN memang tersedia/terdeteksi pada topologi Anda. Jika ONT sudah
+terdaftar, lewati `ont add` dan gunakan port serta ONT ID yang telah ada.
+
+### 3. Buat S-VLAN QinQ dan tandai uplink pada kedua OLT
+
+Definisi VLAN dan atribut QinQ dibuat satu kali di database simulator. Binding
+port dilakukan pada kedua OLT:
+
+```text
+vlan 50 smart
+vlan attrib 50 q-in-q
+port vlan 50 0/2 0
+```
+
+Jalankan tiga baris tersebut di OLT-A. Pada OLT-B, jalankan:
+
+```text
+port vlan 50 0/2 0
+```
+
+`0/2 0` berarti board `0/2`, port `0` (uplink `0/2/0`). Keanggotaan VLAN di
+uplink ini membawa tag S-VLAN 50. Pada simulator, definisi VLAN/atribut dan
+profil dibagi untuk akun `admin`, sedangkan keanggotaan VLAN port tersimpan per
+OLT.
+
+### 4. Tambahkan traffic table dan service-port
+
+Buat traffic table satu kali, kemudian buat service-port dengan index berbeda
+untuk tiap ONT. Jalankan perintah berikut dari console salah satu OLT:
+
+```text
+traffic table ip index 10 cir 4096 priority user-cos 4 priority-policy local-Setting
+service-port index 101 vlan 50 gpon 0/1/0 ont 1 gemport 10 inbound traffic-table index 10 outbound traffic-table index 10
+service-port index 201 vlan 50 gpon 0/1/1 ont 1 gemport 10 inbound traffic-table index 10 outbound traffic-table index 10
+quit
+save
+```
+
+Service-port 101 menghubungkan ONT-A/C-VLAN 10 ke S-VLAN 50; service-port 201
+melakukan hal yang sama untuk ONT-B. Index harus berbeda karena daftar
+service-port dibagi oleh akun simulator. Jika hanya menguji ONT-A menuju
+upstream, cukup tambahkan service-port 101.
+
+### 5. Periksa konfigurasi dan link
+
+Di masing-masing console, ketik `quit` sekali untuk keluar dari global config
+ke privilege mode. Pastikan uplink aktif dan menjadi anggota VLAN 50:
+
+```text
+display port state 0/2/0
+display port vlan 0/2/0
+display vlan 50
+```
+
+Periksa ONT serta service-port:
+
+```text
+display ont info 0/1/0 1
+display service-port all
+```
+
+Pada OLT-B, gunakan `display ont info 0/1/1 1` karena ONT-B berada di GPON
+port `0/1/1`. Pastikan SN, profil, ONT ID, GEM port 10, dan VLAN 50 sesuai.
+
+Untuk mengamati trafik uplink, hubungkan Wireshark ke port tujuan mirroring dan
+mirror uplink `0/2/0` seperti dijelaskan pada bagian
+[Port mirroring dan Wireshark simulator](#port-mirroring-dan-wireshark-simulator).
+
 
