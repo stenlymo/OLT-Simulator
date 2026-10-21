@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Management System OLT</title>
+<style>
+  :root {
+    --line: #cfd6de;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --accent: #1d4ed8;
+    --bg: #eef1f5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Segoe UI", system-ui, Arial, sans-serif;
+    font-size: 14px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  .title-card {
+    margin: 8px auto 34px;
+    width: min(560px, 100%);
+    border: 2px solid var(--ink);
+    background: #fff;
+    text-align: center;
+    padding: 18px 24px;
+    font-size: 20px;
+    letter-spacing: .2px;
+  }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    margin-bottom: 22px;
+  }
+  .toolbar label { font-size: 16px; }
+  select, button, input {
+    font: inherit;
+    color: var(--ink);
+    background: #fff;
+    border: 2px solid var(--ink);
+    border-radius: 0;
+    padding: 7px 12px;
+  }
+  select { min-width: 150px; }
+  button { cursor: pointer; font-size: 16px; padding: 8px 18px; }
+  button:hover { background: #f3f6fa; }
+  button:active { background: #e6ecf4; }
+  button.primary { background: #fff; font-weight: 600; }
+  button:disabled { opacity: .55; cursor: default; }
+
+  .status { color: var(--muted); font-size: 13px; }
+  .status.error { color: #b91c1c; }
+  .auto { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .auto input { width: 15px; height: 15px; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border: 2px solid var(--ink);
+  }
+  th, td {
+    border: 1px solid var(--ink);
+    padding: 7px 10px;
+    text-align: left;
+    white-space: nowrap;
+    font-size: 13.5px;
+  }
+  th { background: #f4f6f9; font-weight: 600; }
+  tbody tr:nth-child(even) { background: #fafbfc; }
+  td.num { text-align: right; }
+  .empty { text-align: center; color: var(--muted); padding: 18px; }
+
+  .hint { margin-top: 10px; color: var(--muted); font-size: 12.5px; }
+
+  details.cli { margin-top: 30px; }
+  details.cli summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  .console {
+    margin-top: 10px;
+    background: #0b1220;
+    color: #9ae6b4;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12.5px;
+    padding: 10px 12px;
+    height: 190px;
+    overflow: auto;
+    white-space: pre-wrap;
+    border: 1px solid #0b1220;
+  }
+  .cli-row { display: flex; gap: 8px; margin-top: 8px; }
+  .cli-row input { flex: 1; }
+  .svc { margin-top: 10px; }
+  .svc-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+  .svc-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+  .svc-row input { border-width: 1px; padding: 5px 8px; font-size: 13px; }
+  #leases { margin-top: 8px; border-width: 1px; }
+  #leases th, #leases td { border-width: 1px; font-size: 12.5px; padding: 5px 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="title-card">Network Management System OLT</div>
+
+  <div class="toolbar">
+    <label for="olt">Select OLT</label>
+    <select id="olt" aria-label="Pilih OLT"></select>
+    <button id="btn-autofind" class="primary" type="button">ONT Autofind</button>
+    <label class="auto"><input type="checkbox" id="auto" checked> Auto-refresh</label>
+    <span id="status" class="status">memuat topologi…</span>
+  </div>
+
+  <table id="ont-table">
+    <thead>
+      <tr>
+        <th style="width:70px">Number</th>
+        <th style="width:90px">F/S/P</th>
+        <th>Ont SN</th>
+        <th>VendorID</th>
+        <th>Ont Version</th>
+        <th>Ont SoftwareVersion</th>
+        <th>Ont EquipmentID</th>
+        <th>Ont autofind time</th>
+      </tr>
+    </thead>
+    <tbody id="tbody">
+      <tr><td class="empty" colspan="8">Pilih OLT lalu klik “ONT Autofind”.</td></tr>
+    </tbody>
+  </table>
+  <div class="hint" id="hint">Data diambil dari perintah <code>display ont autofind all</code> pada OLT terpilih.<span id="updated"></span></div>
+
+  <details class="cli" id="services">
+    <summary>Layanan WAN — PPPoE / DHCP</summary>
+    <div class="svc">
+      <div class="svc-row">
+        <label>F/S/P <input id="svc-port" value="0/1/6"></label>
+        <label>ONT ID <input id="svc-ont" value="0" size="4"></label>
+        <label>Mode
+          <select id="svc-mode">
+            <option value="pppoe">PPPoE</option>
+            <option value="ipoe">IPoE</option>
+          </select>
+        </label>
+        <label>User <input id="svc-user" placeholder="budi@isp"></label>
+        <label>Password <input id="svc-pass" type="password"></label>
+        <label>MAC <input id="svc-mac" placeholder="00:11:22:33:44:55"></label>
+        <label>VLAN <input id="svc-vlan" value="20" size="4"></label>
+      </div>
+      <div class="svc-row">
+        <button id="svc-set" type="button">Set PPPoE</button>
+        <button id="svc-connect" type="button">Connect</button>
+        <button id="svc-disconnect" type="button">Disconnect</button>
+        <span id="svc-status" class="status"></span>
+      </div>
+      <table id="leases">
+        <thead><tr><th>IP</th><th>ONT</th><th>DHCP server</th><th>State</th><th>Option82</th><th>Since</th></tr></thead>
+        <tbody><tr><td colspan="6" class="empty">Belum ada lease.</td></tr></tbody>
+      </table>
+      <div class="hint">Alur: Set PPPoE → Connect. Kredensial dicek ke BRAS, IP diambil dari pool DHCP server yang terpasang di topologi.</div>
+    </div>
+  </details>
+
+  <details class="cli">
+    <summary>CLI console (query &amp; konfigurasi)</summary>
+    <div class="console" id="console"></div>
+    <div class="cli-row">
+      <input id="cmd" type="text" placeholder="display ont info 0 all" autocomplete="off">
+      <button id="send" type="button">Kirim</button>
+      <button id="new-session" type="button">Sesi Baru</button>
+    </div>
+  </details>
+</div>
+
+<script>
+const API = location.origin + "/api/v1";
+const $ = (sel) => document.querySelector(sel);
+
+let sessionId = localStorage.getItem("olt-session") || "";
+let currentNode = "";
+
+function setStatus(text, isError = false) {
+  const el = $("#status");
+  el.textContent = text;
+  el.classList.toggle("error", Boolean(isError));
+}
+
+async function apiGet(path) {
+  const res = await fetch(API + path, {
+    cache: "no-store",
+    headers: { "Accept": "application/json" },
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.ok === false) {
+    throw new Error(json.error || `HTTP ${res.status}`);
+  }
+  return json.data;
+}
+
+function formatTime(value) {
+  if (!value) return "-";
+  // "2026-10-18 12:41:57" -> "18/10/2026 12:41"
+  const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return value;
+  const [, y, m, d, hh, mm] = match;
+  return `${d}/${m}/${y} ${hh}:${mm}`;
+}
+
+function render(rows) {
+  const tbody = $("#tbody");
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td class="empty" colspan="8">Tidak ada ONT yang ditemukan pada OLT ini.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows
+    .map((row, index) => `
+      <tr>
+        <td class="num">${index + 1}</td>
+        <td>${row.fsp}</td>
+        <td>${row.sn}</td>
+        <td>${row.vendor}</td>
+        <td>${row.version}</td>
+        <td>${row.software}</td>
+        <td>${row.equipment}</td>
+        <td>${formatTime(row.found_at)}</td>
+      </tr>`)
+    .join("");
+}
+
+async function loadOlts() {
+  try {
+    const topo = await apiGet("/topology");
+    const olts = topo.nodes.filter((node) => node.type === "olt");
+    const candidates = olts.length ? olts : topo.nodes;
+    const select = $("#olt");
+    select.innerHTML = "";
+    if (!candidates.length) {
+      select.innerHTML = '<option value="">(belum ada OLT di topologi)</option>';
+      setStatus("Topologi kosong — buat topologi di aplikasi OLT Simulator.", true);
+      return;
+    }
+    for (const node of candidates) {
+      const option = document.createElement("option");
+      option.value = node.name;
+      option.textContent = node.sysname || node.name;
+      select.appendChild(option);
+    }
+    currentNode = select.value;
+    setStatus(`${candidates.length} OLT tersedia`);
+    loadLeases();
+    select.onchange = () => {
+      currentNode = select.value;
+      setStatus(`OLT dipilih: ${select.selectedOptions[0].textContent}`);
+      refreshAutofind(true);
+      loadLeases();
+    };
+  } catch (err) {
+    setStatus("Gagal memuat topologi: " + err.message, true);
+  }
+}
+
+async function refreshAutofind(silent = false) {
+  const button = $("#btn-autofind");
+  if (!currentNode) {
+    setStatus("Pilih OLT terlebih dahulu.", true);
+    return;
+  }
+  if (!silent) {
+    button.disabled = true;
+    setStatus("Menjalankan display ont autofind all …");
+  }
+  try {
+    const rows = await apiGet(`/nodes/${encodeURIComponent(currentNode)}/autofind`);
+    render(rows);
+    $("#updated").textContent =
+      ` · diperbarui ${new Date().toLocaleTimeString("id-ID")}`;
+    setStatus(`${rows.length} ONT ditemukan pada ${currentNode}`);
+  } catch (err) {
+    if (!silent) {
+      render([]);
+      setStatus("Autofind gagal: " + err.message, true);
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ---------- CLI console ----------
+function log(text, color) {
+  const line = document.createElement("div");
+  line.textContent = text;
+  if (color) line.style.color = color;
+  $("#console").appendChild(line);
+  $("#console").scrollTop = $("#console").scrollHeight;
+}
+
+async function sendCommand() {
+  const input = $("#cmd");
+  const command = input.value.trim();
+  if (!command || !currentNode) return;
+  input.value = "";
+  try {
+    const res = await fetch(`${API}/nodes/${encodeURIComponent(currentNode)}/cli`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(sessionId ? { "X-Session-Id": sessionId } : {}),
+      },
+      body: JSON.stringify({ command }),
+    });
+    const sid = res.headers.get("X-Session-Id");
+    if (sid) {
+      sessionId = sid;
+      localStorage.setItem("olt-session", sid);
+    }
+    const json = await res.json();
+    const data = json.data || {};
+    log(`${data.prompt || ""} ${command}`);
+    log(data.output || "(tanpa output)", json.ok ? "#9ae6b4" : "#fca5a5");
+    if (/^(display|show|ont|vlan|service-port|undo)\b/i.test(command)) {
+      refreshAutofind(true);
+    }
+  } catch (err) {
+    log("Error: " + err.message, "#fca5a5");
+  }
+}
+
+$("#btn-autofind").onclick = () => refreshAutofind(false);
+
+// Auto-refresh tabel mengikuti kondisi topologi terbaru
+setInterval(() => {
+  if (!$("#auto").checked || !currentNode || document.hidden) return;
+  if ($("#btn-autofind").disabled) return;
+  refreshAutofind(true);
+}, 5000);
+
+$("#send").onclick = sendCommand;
+$("#cmd").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") sendCommand();
+});
+$("#new-session").onclick = () => {
+  sessionId = "";
+  localStorage.removeItem("olt-session");
+  $("#console").innerHTML = "";
+  log("Sesi baru. Mulai dengan 'enable'.", "#94a3b8");
+};
+
+// ---------- layanan WAN: PPPoE / DHCP ----------
+async function apiPost(path, payload) {
+  const res = await fetch(API + path, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.ok === false) {
+    throw new Error(json.error || `HTTP ${res.status}`);
+  }
+  return json.data;
+}
+
+function setSvcStatus(text, isError = false) {
+  const el = $("#svc-status");
+  el.textContent = text;
+  el.classList.toggle("error", Boolean(isError));
+}
+
+function svcFields() {
+  return {
+    port: $("#svc-port").value.trim() || "0/1/0",
+    ont: $("#svc-ont").value.trim() || "0",
+    mode: $("#svc-mode").value,
+    user: $("#svc-user").value.trim(),
+    pass: $("#svc-pass").value,
+    mac: $("#svc-mac").value.trim(),
+    vlan: Number($("#svc-vlan").value || 0),
+  };
+}
+
+async function loadLeases() {
+  if (!currentNode) return;
+  try {
+    const rows = await apiGet(`/nodes/${encodeURIComponent(currentNode)}/leases`);
+    const active = rows.filter((row) => row.state === "active");
+    const tbody = $("#leases tbody");
+    tbody.innerHTML = active.length
+      ? active
+          .map(
+            (row) =>
+              `<tr><td>${row.ip}</td><td>${row.ont_name}</td><td>${row.server_node}</td>` +
+              `<td>${row.state}</td><td>${row.circuit_id || "-"}</td><td>${formatTime(row.started_at)}</td></tr>`
+          )
+          .join("")
+      : '<tr><td colspan="6" class="empty">Belum ada lease aktif.</td></tr>';
+  } catch (err) {
+    // panel tetap diam bila endpoint belum tersedia
+  }
+}
+
+$("#svc-set").onclick = async () => {
+  const fields = svcFields();
+  try {
+    if (fields.mode === "ipoe") {
+      await apiPost(
+        `/nodes/${encodeURIComponent(currentNode)}/onts/${encodeURIComponent(fields.ont)}/ipoe`,
+        { port: fields.port, vlan: fields.vlan, mac: fields.mac }
+      );
+      setSvcStatus(`IPoE tersimpan untuk ONT ${fields.ont} (MAC ${fields.mac})`);
+    } else {
+      await apiPost(
+        `/nodes/${encodeURIComponent(currentNode)}/onts/${encodeURIComponent(fields.ont)}/pppoe`,
+        { port: fields.port, username: fields.user, password: fields.pass, vlan: fields.vlan }
+      );
+      setSvcStatus(`PPPoE tersimpan untuk ONT ${fields.ont} (${fields.user})`);
+    }
+  } catch (err) {
+    setSvcStatus("Gagal menyimpan: " + err.message, true);
+  }
+};
+
+$("#svc-connect").onclick = async () => {
+  const fields = svcFields();
+  try {
+    const data = await apiPost(
+      `/nodes/${encodeURIComponent(currentNode)}/onts/${encodeURIComponent(fields.ont)}/connect`,
+      { port: fields.port }
+    );
+    setSvcStatus(`Berhasil: IP ${data.ip} (pool ${data.pool} @ ${data.server_node})`);
+    loadLeases();
+    refreshAutofind(true);
+  } catch (err) {
+    setSvcStatus("Connect gagal: " + err.message, true);
+  }
+};
+
+$("#svc-disconnect").onclick = async () => {
+  const fields = svcFields();
+  try {
+    await apiPost(
+      `/nodes/${encodeURIComponent(currentNode)}/onts/${encodeURIComponent(fields.ont)}/disconnect`,
+      { port: fields.port }
+    );
+    setSvcStatus("Sesi PPPoE diputus, IP dilepas.");
+    loadLeases();
+  } catch (err) {
+    setSvcStatus("Disconnect gagal: " + err.message, true);
+  }
+};
+
+setInterval(() => {
+  if (!currentNode || document.hidden) return;
+  if ($("#services").open) loadLeases();
+}, 8000);
+
+// Untuk embed/otomasi: /?node=Huawei_1&autofind=1 langsung menampilkan hasil
+(async () => {
+  const params = new URLSearchParams(location.search);
+  await loadOlts();
+  const wanted = params.get("node");
+  if (wanted) {
+    const select = $("#olt");
+    if ([...select.options].some((option) => option.value === wanted)) {
+      select.value = wanted;
+      currentNode = wanted;
+      setStatus(`OLT dipilih: ${select.selectedOptions[0].textContent}`);
+    }
+  }
+  if (params.get("autofind") === "1") await refreshAutofind(false);
+  if (params.get("services") === "1") {
+    $("#services").open = true;
+    loadLeases();
+  }
+})();
+</script>
+</body>
+</html>

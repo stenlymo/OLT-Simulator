@@ -1,0 +1,27 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local simulator databases may contain saved topologies/configuration
+*.db
+*.db-shm
+*.db-wal
+
+# Temporary files, test databases, and extracted vendor-document content
+tmp/
+extracted/
+~$*
+
+# Local vendor/source guides are not required to run the simulator. Keep the
+# project dependency manifest and the simulator's own Markdown documentation.
+/*.docx
+/*.hdx
+/*.txt
+!/requirements.txt
+/data1.json
+
