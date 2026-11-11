@@ -1,22 +1,58 @@
 # Huawei SmartAX GPON OLT Network Simulator
 
-Simulator GUI untuk latihan konfigurasi Huawei SmartAX GPON OLT. Aplikasi
-memakai Python, PyQt6, dan SQLite; mendukung topologi FTTH, CLI OLT, konfigurasi
-ONT, layanan DHCP/PPPoE, serta beberapa fitur simulasi jaringan.
+Simulator GUI untuk latihan konfigurasi Huawei SmartAX GPON OLT dan jaringan
+Datacom. Aplikasi memakai Python, PyQt6, dan SQLite; mencakup topologi FTTH,
+perangkat OLT/ONT, PC, switch, router, access point, server, CLI, serta model
+layanan dan routing untuk latihan.
 
-## Panduan instalasi Windows dari Google Drive
+## Fitur simulator
 
-Langkah berikut ditujukan untuk pengguna yang mengunduh salinan folder proyek
-dari Google Drive. Tidak perlu memasang Git.
+- **FTTH dan GPON** — topologi OLT, OTB, splitter, roset, ONT, PC; provisioning
+  DBA/line/service profile, VLAN, GEM, service-port, ONT status, dan optical info.
+- **Layanan pelanggan** — simulasi DHCP, PPPoE/BRAS, IPoE, WAN ONT, serta
+  pengamatan paket terpilih melalui Wireshark simulator dan port mirroring.
+- **OLT dan Ethernet** — VLAN/VLANIF, static route, QinQ, BPDU, LACP, uplink
+  Ethernet, SFP, DDM, dan konfigurasi port.
+- **Huawei Datacom** — switch, router, dan Fit AP dengan latihan VLAN, STP,
+  link aggregation, IPv4/IPv6 routing, OSPF, IS-IS, BGP, ACL, DHCP, NAT,
+  remote login, WLAN, MPLS L3VPN, EVPN, VXLAN, SR-MPLS, dan SRv6.
+- **Topologi dan data** — kabel antar-device, konfigurasi tersimpan di SQLite,
+  terminal CLI per-device, serta REST API opsional.
+
+Simulator memodelkan perilaku dan control-plane untuk latihan. Beberapa fitur
+advanced seperti MPLS, SR-MPLS, SRv6, EVPN, dan VXLAN belum meneruskan paket
+secara byte-level seperti perangkat produksi. Lihat catatan batas fitur pada
+dokumen lab terkait sebelum menggunakan hasil simulasi sebagai validasi
+forwarding.
+
+## Dokumentasi lab
+
+- [Contoh konfigurasi PC_6 ke PC_11 melalui OLT dan backbone](sim.md)
+- [Lab L3VPN over MPLS dari ONT sampai router PE](mpls.md)
+- [HCIE Datacom Bab 6 — Campus deployment](docs/HCIE_CHAPTER_6.md)
+- [HCIE Datacom Bab 8 — SR-MPLS](docs/HCIE_CHAPTER_8_SRMPLS.md)
+- [HCIE Datacom Bab 9 — SRv6](docs/HCIE_CHAPTER_9_SRV6.md)
+- [Perhitungan link budget GPON](docs/link_budget.md)
+
+## Panduan instalasi Windows dari GitHub atau ZIP
+
+Unduh proyek dari [repositori OLT-Simulator di GitHub](https://github.com/stenlymo/OLT-Simulator).
+Git tidak wajib jika Anda memilih mengunduh ZIP.
 
 ### 1. Unduh dan ekstrak proyek
 
-1. Unduh file ZIP proyek dari Google Drive.
+1. Buka repositori GitHub, pilih **Code → Download ZIP**.
 2. Di File Explorer, klik kanan ZIP lalu pilih **Extract All / Ekstrak Semua**.
 3. Simpan folder hasil ekstrak di lokasi yang bisa ditulis, misalnya
    `C:\olt-simulator` atau folder Documents.
-4. Pastikan file `main.py`, `requirements.txt`, dan folder `gui`, `modules`,
-   serta `api` ada di dalam folder yang sama.
+4. Pastikan file `main.py`, `requirements.txt`, serta folder `gui`, `modules`,
+   `api`, dan `icon` berada di root proyek yang sama. Folder `icon` berisi
+   gambar perangkat yang dipakai pada kanvas; jangan memisahkannya dari source.
+
+File Python di `gui/` dan `modules/` menjalankan aplikasi dan fitur CLI.
+Dokumen `.md` di root dan `docs/` berisi panduan konfigurasi; file tersebut
+tidak diperlukan untuk membuka GUI, tetapi disertakan untuk belajar dan mengikuti
+lab. PDF di `labguide/` bukan kebutuhan runtime simulator.
 
 > Jangan membagikan folder `venv` milik komputer pembuat. Virtual environment
 > berisi file khusus mesin/lokasi Python tersebut; setiap pengguna membuat
