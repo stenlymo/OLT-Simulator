@@ -27,6 +27,7 @@ forwarding.
 
 ## Dokumentasi lab
 
+- [Panduan Datacom untuk router dan switch](readme_datacom.md)
 - [Contoh konfigurasi PC_6 ke PC_11 melalui OLT dan backbone](sim.md)
 - [Lab L3VPN over MPLS dari ONT sampai router PE](mpls.md)
 - [HCIE Datacom Bab 6 — Campus deployment](docs/HCIE_CHAPTER_6.md)
