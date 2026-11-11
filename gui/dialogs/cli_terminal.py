@@ -660,6 +660,9 @@ class AuthenticCLITerminal(QTextEdit):
       super().wheelEvent(event)
 
   def keyPressEvent(self, event):
+    terminal_handler = getattr(self.dlg, "handle_terminal_key", None)
+    if callable(terminal_handler) and terminal_handler(event):
+      return
     cursor = self.textCursor()
     if (
         event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Left)
@@ -689,7 +692,7 @@ class AuthenticCLITerminal(QTextEdit):
     elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
       full_text = self.toPlainText()
       input_cmd = full_text[self.dlg.prompt_position :].strip()
-      if input_cmd:
+      if input_cmd and not getattr(self.dlg, "suppress_command_history", False):
         self.command_history.append(input_cmd)
         self.history_index = len(self.command_history)
       self.dlg.append_plain_text("")
@@ -1335,6 +1338,42 @@ class CLITerminalDialog(QWidget):
           if reachable: break
 
       if not reachable:
+        # Directly connected OLT VLANIFs can also reach a Datacom switch or
+        # router interface in the same IPv4 subnet, using the actual VLAN/LAG
+        # path between their nodes.
+        from modules.datacom_network import _topology_path_exists, path_allows_vlan
+        datacom_rows = cursor.execute(
+            "SELECT node_name,running_json FROM olt_datacom_devices WHERE username=?", (self.username,)
+        ).fetchall()
+        for peer_node, raw_config in datacom_rows:
+          try:
+            peer_config = json.loads(raw_config or "{}")
+          except (TypeError, ValueError):
+            continue
+          peer_iface = next((iface for iface in (peer_config.get("interfaces") or {}).values()
+                             if iface.get("ip") == destination and not iface.get("shutdown")), None)
+          if not peer_iface:
+            continue
+          peer_network = ipaddress.IPv4Network(f"{destination}/{peer_iface.get('mask') or '255.255.255.0'}", strict=False)
+          for local_vlan, local_ip, local_mask in local_rows:
+            if vlanif is not None and vlanif != local_vlan:
+              continue
+            if source_ip and source_ip != local_ip:
+              continue
+            if ipaddress.IPv4Network(f"{local_ip}/{local_mask}", strict=False) != peer_network:
+              continue
+            if not _topology_path_exists(conn, self.username, self.node_name, peer_node):
+              continue
+            vlan_reachable, _checked = path_allows_vlan(conn, self.username, self.node_name, peer_node, local_vlan)
+            if vlan_reachable:
+              reachable = True
+              chosen_source = source_ip or local_ip
+              target_node = peer_node
+              break
+          if reachable:
+            break
+
+      if not reachable:
         # OLT <-> DHCP/PPPoE server lewat access port + VLANIF se-subnet
         servers = cursor.execute(
             "SELECT node_name, local_ip FROM sim_service_nodes"
@@ -1383,6 +1422,30 @@ class CLITerminalDialog(QWidget):
               break
           if reachable:
             break
+      if not reachable:
+        peer_node = None
+        for candidate_node, candidate_json in cursor.execute(
+            "SELECT node_name,running_json FROM olt_datacom_devices WHERE username=?", (self.username,)
+        ).fetchall():
+          try:
+            candidate_config = json.loads(candidate_json or "{}")
+          except (TypeError, ValueError):
+            continue
+          if any(iface.get("ip") == destination and not iface.get("shutdown")
+                 for iface in (candidate_config.get("interfaces") or {}).values()):
+            peer_node = candidate_node
+            break
+        if peer_node:
+          from modules.datacom_network import routed_ping_reachable
+          for local_vlan, local_ip, _local_mask in local_rows:
+            if (vlanif is not None and vlanif != local_vlan) or (source_ip and source_ip != local_ip):
+              continue
+            if routed_ping_reachable(conn, self.username, self.node_name, peer_node, destination,
+                                     source_address=local_ip):
+              reachable = True
+              chosen_source = local_ip
+              target_node = peer_node
+              break
       conn.close()
       if source_ip and not any(row[1] == source_ip for row in local_rows):
         reachable = False
@@ -1977,6 +2040,20 @@ class CLITerminalDialog(QWidget):
     return sorted(ports)
 
   def _lag_member_status(self, conn, member_port, local_workmode):
+    try:
+      from modules.datacom_network import datacom_topology_links
+      _logical_links, lag_info = datacom_topology_links(conn, self.username)
+      state = lag_info.get("member_states", {}).get((self.node_name, member_port))
+      if state:
+        if state == "Selected":
+          return "Forwarding", "Online", "C&D" if local_workmode == "lacp-static" else "None"
+        if state == "Down":
+          return "Block", "Offline", "Non-C&D" if local_workmode == "lacp-static" else "None"
+        if state == "Unselected (no peer Eth-Trunk)":
+          return "Block", "Online", "Non-C&D" if local_workmode == "lacp-static" else "None"
+        return "Block", "Online", "Non-C&D" if local_workmode == "lacp-static" else "None"
+    except (KeyError, TypeError, ValueError):
+      pass
     row = conn.execute(
         "SELECT source_node,target_node,source_port,target_port,is_up "
         "FROM olt_device_links WHERE username = ? AND "
@@ -2074,7 +2151,10 @@ class CLITerminalDialog(QWidget):
         if not masters: raise ValueError("No link aggregation group exists.")
         conn.close()
         self.pending_confirmation = ("lag-delete", masters, {})
-        self.append_plain_text("\n  This operation may interrupt services and remove LACP backup. Continue? (y/n)[n]:")
+        self.append_plain_text(
+            "\n  This operation will clear the configuration of slave port, and may "
+            "cause service interruption of slave port, are you sure to continue? (y/n)[n]:"
+        )
         return True
 
       if lower[0] == "display":
@@ -2123,6 +2203,28 @@ class CLITerminalDialog(QWidget):
       try: conn.close()
       except Exception: pass
 
+  def _refresh_olt_uplink_links(self, board, port_ids):
+    from gui.models.link import OpticalLinkItem
+    main_window = self.parent()
+    scene = getattr(main_window, "scene", None)
+    if scene is None:
+      return
+    port_ids = set(map(int, port_ids))
+    for item in scene.items():
+      if not isinstance(item, OpticalLinkItem):
+        continue
+      for node, port in ((item.source_node, item.source_port), (item.target_node, item.target_port)):
+        if node.device_name != self.node_name or not port.startswith(board + "/"):
+          continue
+        try:
+          if int(port.rsplit("/", 1)[1]) in port_ids:
+            item.calculate_attenuation()
+        except ValueError:
+          continue
+    sync_links = getattr(main_window, "_sync_topology_links", None)
+    if callable(sync_links):
+      sync_links()
+
   def handle_simplified_triple_play_command(self, cmd, cmd_lower):
     """Handle commands required by the simplified triple-play guide."""
     try:
@@ -2160,6 +2262,7 @@ class CLITerminalDialog(QWidget):
             )
           conn.commit()
           conn.close()
+          self._refresh_olt_uplink_links(board, vlan_id)
           self.append_plain_text(f"\n  Auto-negotiation disabled on ETH port(s) {', '.join(map(str, vlan_id))}.")
           self.pending_confirmation = None
           return True
@@ -2323,6 +2426,7 @@ class CLITerminalDialog(QWidget):
           for port_id in port_ids:
             cursor.execute("INSERT INTO olt_eth_port_settings (username,node_name,board,port_id,speed) VALUES (?,?,?,?,?) ON CONFLICT(username,node_name,board,port_id) DO UPDATE SET speed=excluded.speed", (self.username, self.node_name, self.current_eth_board, port_id, speed))
           conn.commit(); conn.close()
+          self._refresh_olt_uplink_links(self.current_eth_board, port_ids)
           self.append_plain_text(f"\n  Speed of ETH port(s) {', '.join(map(str, port_ids))} set to {speed} Mbit/s.")
           return True
 
@@ -2336,6 +2440,7 @@ class CLITerminalDialog(QWidget):
         for port_id in port_ids:
           cursor.execute("INSERT INTO olt_eth_port_settings (username,node_name,board,port_id,auto_neg) VALUES (?,?,?,?,1) ON CONFLICT(username,node_name,board,port_id) DO UPDATE SET auto_neg=1", (self.username, self.node_name, self.current_eth_board, port_id))
         conn.commit(); conn.close()
+        self._refresh_olt_uplink_links(self.current_eth_board, port_ids)
         self.append_plain_text(f"\n  Auto-negotiation enabled on ETH port(s) {', '.join(map(str, port_ids))}.")
         return True
       except (ValueError, IndexError) as exc:

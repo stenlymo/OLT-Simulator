@@ -135,11 +135,15 @@ def _topology_reachable(conn, username, olt_node, ont_name):
       " FROM olt_device_links WHERE username = ?",
       (username,),
   ).fetchall()
+  from modules.datacom_network import stp_blocked_link_keys, datacom_active_physical_link_keys
+  blocked_links = stp_blocked_link_keys(conn, username)
+  active_links = datacom_active_physical_link_keys(conn, username)
   if not links:
     return True
   adjacency = {}
   for source, target, source_port, target_port, is_up in links:
-    if not is_up:
+    edge_key = tuple(sorted(((source, source_port), (target, target_port))))
+    if not is_up or edge_key not in active_links or edge_key in blocked_links:
       continue
     adjacency.setdefault(source, []).append(target)
     adjacency.setdefault(target, []).append(source)
@@ -316,12 +320,15 @@ def set_ont_pppoe(username, olt_node, port, ont_id, pppoe_user,
 # --------------------------------------------------------------------------- #
 # koneksi PPPoE + alokasi DHCP
 # --------------------------------------------------------------------------- #
-def _pick_pool(conn, username, olt_node=None):
+def _pick_pool(conn, username, olt_node=None, vlan=None):
   rows = _rows(
       conn,
       "SELECT * FROM sim_dhcp_pools WHERE username = ? ORDER BY server_node",
       (username,),
   )
+  if vlan is not None:
+    matching = [pool for pool in rows if int(pool.get("vlan") or 0) in (0, int(vlan))]
+    rows = sorted(matching, key=lambda pool: int(pool.get("vlan") or 0) != int(vlan))
   return rows[0] if rows else None
 
 
@@ -379,7 +386,7 @@ def connect(username, olt_node, port, ont_id):
       return {"ok": False, "message": f"ONT {ont_name} tidak terhubung ke OLT (kabel/LOS)."}
 
     account = conn.execute(
-        "SELECT bras_node, profile FROM sim_bras_users"
+        "SELECT bras_node, profile, vlan FROM sim_bras_users"
         " WHERE username = ? AND pppoe_user = ? AND pppoe_pass = ?",
         (username, pppoe_user, pppoe_pass),
     ).fetchone()
@@ -395,7 +402,14 @@ def connect(username, olt_node, port, ont_id):
           "message": f"PPPoE authentication failed untuk user '{pppoe_user}'.",
       }
 
-    bras_node, profile = account
+    bras_node, profile, account_vlan = account
+    service_vlan = int(wan_vlan or account_vlan or 1)
+    from modules.datacom_network import path_allows_vlan
+    vlan_path_ok, vlan_path_checked = path_allows_vlan(
+        conn, username, olt_node or "", bras_node, service_vlan
+    )
+    if vlan_path_checked and not vlan_path_ok:
+      return {"ok": False, "message": f"PPPoE VLAN {service_vlan} is blocked by the Datacom switch port configuration."}
 
     from modules.commands import pitp
 
@@ -405,9 +419,12 @@ def connect(username, olt_node, port, ont_id):
     if not pitp_ok:
       return {"ok": False, "message": pitp_msg}
 
-    pool = _pick_pool(conn, username, olt_node)
+    pool = _pick_pool(conn, username, olt_node, service_vlan)
     if not pool:
-      return {"ok": False, "message": "Belum ada DHCP pool yang dikonfigurasi."}
+      return {"ok": False, "message": f"Belum ada DHCP pool yang sesuai dengan VLAN {service_vlan}."}
+    dhcp_ok, dhcp_checked = path_allows_vlan(conn, username, bras_node, pool["server_node"], service_vlan)
+    if dhcp_checked and not dhcp_ok:
+      return {"ok": False, "message": f"DHCP server tidak dapat dijangkau pada VLAN {service_vlan}."}
 
     existing = conn.execute(
         "SELECT ip FROM sim_leases WHERE username = ? AND ont_name = ?"
@@ -498,9 +515,15 @@ def _connect_ipoe(conn, username, olt_node, port, ont_id, ont):
   if not connected:
     return {"ok": False, "message": f"ONT {ont_name} tidak terhubung ke OLT (kabel/LOS)."}
 
-  pool = _pick_pool(conn, username, olt_node)
+  vlan_id = int(wan_vlan or 0)
+  pool = _pick_pool(conn, username, olt_node, vlan_id if vlan_id else None)
   if not pool:
-    return {"ok": False, "message": "Belum ada DHCP pool yang dikonfigurasi."}
+    return {"ok": False, "message": f"Belum ada DHCP pool yang sesuai dengan VLAN {vlan_id}." if vlan_id else "Belum ada DHCP pool yang dikonfigurasi."}
+  if olt_node:
+    from modules.datacom_network import path_allows_vlan
+    dhcp_ok, dhcp_checked = path_allows_vlan(conn, username, olt_node, pool["server_node"], vlan_id or int(pool.get("vlan") or 1))
+    if dhcp_checked and not dhcp_ok:
+      return {"ok": False, "message": f"DHCP server tidak dapat dijangkau pada VLAN {vlan_id or pool.get('vlan')}."}
 
   key = ont_name or f"{port}/{ont_id}"
   existing = conn.execute(
@@ -735,7 +758,7 @@ def connect_pc(username, pc_node):
       }
 
     account = conn.execute(
-        "SELECT bras_node FROM sim_bras_users"
+        "SELECT bras_node, vlan FROM sim_bras_users"
         " WHERE username = ? AND pppoe_user = ? AND pppoe_pass = ?",
         (username, pppoe_user, pppoe_pass),
     ).fetchone()
@@ -744,7 +767,14 @@ def connect_pc(username, pc_node):
           "ok": False,
           "message": f"PPPoE authentication failed untuk user '{pppoe_user}'.",
       }
-    bras_node = account[0]
+    bras_node, account_vlan = account
+    service_vlan = int(vlan or account_vlan or 1)
+    from modules.datacom_network import path_allows_vlan
+    vlan_path_ok, vlan_path_checked = path_allows_vlan(
+        conn, username, pc_node, bras_node, service_vlan
+    )
+    if vlan_path_checked and not vlan_path_ok:
+      return {"ok": False, "message": f"PPPoE VLAN {service_vlan} is blocked by the Datacom switch port configuration."}
 
     from modules.commands import pitp
 
@@ -754,9 +784,12 @@ def connect_pc(username, pc_node):
     if not pitp_ok:
       return {"ok": False, "message": pitp_msg}
 
-    pool = _pick_pool(conn, username)
+    pool = _pick_pool(conn, username, vlan=service_vlan)
     if not pool:
-      return {"ok": False, "message": "Belum ada DHCP pool yang dikonfigurasi."}
+      return {"ok": False, "message": f"Belum ada DHCP pool yang sesuai dengan VLAN {service_vlan}."}
+    dhcp_ok, dhcp_checked = path_allows_vlan(conn, username, bras_node, pool["server_node"], service_vlan)
+    if dhcp_checked and not dhcp_ok:
+      return {"ok": False, "message": f"DHCP server tidak dapat dijangkau pada VLAN {service_vlan}."}
     existing = conn.execute(
         "SELECT ip FROM sim_leases WHERE username = ? AND ont_name = ?"
         " AND state = 'active'",

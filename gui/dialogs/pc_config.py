@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QDialog,
     QDialogButtonBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QLabel,
@@ -43,6 +44,20 @@ class PCConfigDialog(QDialog):
     form.addRow("Default gateway:", self.gateway)
     layout.addLayout(form)
 
+    wired_group = QGroupBox("Wired LAN (DHCP)")
+    wired_form = QFormLayout(wired_group)
+    self.wired_status = QLabel("No DHCP lease")
+    wired_form.addRow("Status:", self.wired_status)
+    wired_buttons = QHBoxLayout()
+    self.wired_dhcp_button = QPushButton("Obtain DHCP")
+    self.wired_dhcp_button.clicked.connect(self.obtain_wired_dhcp)
+    self.wired_release_button = QPushButton("Release")
+    self.wired_release_button.clicked.connect(self.release_wired_dhcp)
+    wired_buttons.addWidget(self.wired_dhcp_button)
+    wired_buttons.addWidget(self.wired_release_button)
+    wired_form.addRow(wired_buttons)
+    layout.addWidget(wired_group)
+
     ping_form = QHBoxLayout()
     self.ping_target = QLineEdit(node_item.pc_config.get("gateway", ""))
     self.ping_target.setPlaceholderText("Destination IPv4 address")
@@ -57,6 +72,28 @@ class PCConfigDialog(QDialog):
     self.ping_output.setMaximumHeight(150)
     self.ping_output.setPlaceholderText("Ping results will appear here.")
     layout.addWidget(self.ping_output)
+
+    wlan_group = QGroupBox("WLAN client (Fit AP)")
+    wlan_form = QFormLayout(wlan_group)
+    self.wlan_network = QComboBox()
+    self.wlan_password = QLineEdit()
+    self.wlan_password.setEchoMode(QLineEdit.EchoMode.Password)
+    self.wlan_status = QLabel("Disconnected")
+    wlan_form.addRow("Available network:", self.wlan_network)
+    wlan_form.addRow("Password:", self.wlan_password)
+    wlan_form.addRow("Status:", self.wlan_status)
+    wlan_buttons = QHBoxLayout()
+    self.wlan_scan_button = QPushButton("Scan")
+    self.wlan_scan_button.clicked.connect(self.refresh_wlan)
+    self.wlan_connect_button = QPushButton("Connect")
+    self.wlan_connect_button.clicked.connect(self.connect_wlan)
+    self.wlan_disconnect_button = QPushButton("Disconnect")
+    self.wlan_disconnect_button.clicked.connect(self.disconnect_wlan)
+    wlan_buttons.addWidget(self.wlan_scan_button)
+    wlan_buttons.addWidget(self.wlan_connect_button)
+    wlan_buttons.addWidget(self.wlan_disconnect_button)
+    wlan_form.addRow(wlan_buttons)
+    layout.addWidget(wlan_group)
 
     # PPPoE client: PC dial melalui ONT bridge ke BRAS
     pppoe_group = QGroupBox("PPPoE Client (dial from this PC)")
@@ -93,6 +130,135 @@ class PCConfigDialog(QDialog):
     buttons.rejected.connect(self.reject)
     layout.addWidget(buttons)
     self.refresh_pppoe()
+    self.refresh_wired_dhcp()
+    self.refresh_wlan()
+
+  def refresh_wlan(self):
+    from modules.datacom_wlan import scan_networks, station_info
+    self.wlan_network.clear()
+    scene = self.node_item.scene()
+    conn = get_connection()
+    try:
+      networks = scan_networks(conn, "admin", scene)
+      station = station_info(conn, "admin", self.node_item.device_name)
+    finally:
+      conn.close()
+    for network in networks:
+      label = f"{network['ssid']} — {network['ap_name']} ({network['ap_node']})"
+      self.wlan_network.addItem(label, network)
+    if station:
+      self.wlan_status.setText(f"Connected to {station['ssid']} via {station['ap_node']} — {station['ip']}")
+      self.node_item.pc_config.update({"ip_address": station["ip"], "subnet_mask": "255.255.255.0"})
+      # Restore the exact DHCP mask/gateway from the configured WAC VLANIF.
+      config_conn = get_connection()
+      try:
+        row = config_conn.execute("SELECT running_json FROM olt_datacom_devices WHERE username=? AND node_name=?", ("admin", station.get("dhcp_node") or station["wac"])).fetchone()
+        cfg = json.loads(row[0]) if row else {}
+        iface = (cfg.get("interfaces") or {}).get(station["vlanif"], {})
+        self.node_item.pc_config.update({"subnet_mask": iface.get("mask", "255.255.255.0"), "gateway": iface.get("ip", "")})
+      except (TypeError, ValueError):
+        pass
+      finally:
+        config_conn.close()
+      self.ip_address.setText(self.node_item.pc_config["ip_address"])
+      self.subnet_mask.setText(self.node_item.pc_config["subnet_mask"])
+      self.gateway.setText(self.node_item.pc_config["gateway"])
+      self.ping_target.setText(self.node_item.pc_config["gateway"])
+    else:
+      self.wlan_status.setText("Disconnected")
+    return networks
+
+  def refresh_wired_dhcp(self):
+    from modules.datacom_wlan import wired_pc_info
+    conn = get_connection()
+    try:
+      lease = wired_pc_info(conn, "admin", self.node_item.device_name)
+      if lease:
+        row = conn.execute("SELECT running_json FROM olt_datacom_devices WHERE username=? AND node_name=?",
+                           ("admin", lease["dhcp_node"])).fetchone()
+        cfg = json.loads(row[0]) if row else {}
+        iface = (cfg.get("interfaces") or {}).get(lease["vlanif"], {})
+    except (TypeError, ValueError):
+      lease, iface = None, {}
+    finally:
+      conn.close()
+    if lease:
+      self.node_item.pc_config.update({"ip_address": lease["ip"], "subnet_mask": iface.get("mask", "255.255.255.0"),
+                                       "gateway": iface.get("dhcp_server_gateway") or iface.get("ip", "")})
+      self.ip_address.setText(self.node_item.pc_config["ip_address"])
+      self.subnet_mask.setText(self.node_item.pc_config["subnet_mask"])
+      self.gateway.setText(self.node_item.pc_config["gateway"])
+      self.wired_status.setText(f"Bound to {lease['dhcp_node']} {lease['vlanif']}: {lease['ip']}")
+    return lease
+
+  def obtain_wired_dhcp(self):
+    from modules.datacom_wlan import acquire_wired_pc, mac_for_node
+    conn = get_connection()
+    try:
+      result = acquire_wired_pc(conn, "admin", self.node_item,
+                                mac_for_node(self.node_item.device_name, "001b"),
+                                self.node_item.scene())
+    finally:
+      conn.close()
+    if not result.get("ok"):
+      self.wired_status.setText(result.get("message", "DHCP request failed."))
+      return False
+    self.node_item.pc_config.update({"ip_address": result["ip"], "subnet_mask": result["mask"], "gateway": result["gateway"]})
+    self.node_item.update()
+    self.ip_address.setText(result["ip"])
+    self.subnet_mask.setText(result["mask"])
+    self.gateway.setText(result["gateway"])
+    self.ping_target.setText(result["gateway"])
+    self.wired_status.setText(f"Bound to {result['dhcp_node']} {result['vlanif']}: {result['ip']}")
+    return True
+
+  def release_wired_dhcp(self):
+    from modules.datacom_wlan import release_pc
+    conn = get_connection()
+    try:
+      release_pc(conn, "admin", self.node_item.device_name)
+    finally:
+      conn.close()
+    self.node_item.pc_config.update({"ip_address": "", "subnet_mask": "", "gateway": ""})
+    self.node_item.update()
+    self.ip_address.clear(); self.subnet_mask.clear(); self.gateway.clear()
+    self.wired_status.setText("DHCP lease released")
+    return True
+
+  def connect_wlan(self):
+    network = self.wlan_network.currentData()
+    if not network:
+      self.wlan_status.setText("No WLAN is available. Check AP registration, VLAN trunk, and DHCP.")
+      return False
+    from modules.datacom_wlan import connect_station, mac_for_node
+    conn = get_connection()
+    try:
+      result = connect_station(conn, "admin", self.node_item.device_name, mac_for_node(self.node_item.device_name, "001b"),
+                               network["ap_node"], network["ssid"], self.wlan_password.text(), self.node_item.scene())
+    finally:
+      conn.close()
+    if not result.get("ok"):
+      self.wlan_status.setText(result.get("message", "WLAN connection failed."))
+      return False
+    self.node_item.pc_config.update({"ip_address": result["ip"], "subnet_mask": result["mask"], "gateway": result["gateway"]})
+    self.node_item.update()
+    self.ip_address.setText(result["ip"])
+    self.subnet_mask.setText(result["mask"])
+    self.gateway.setText(result["gateway"])
+    self.ping_target.setText(result["gateway"])
+    self.wlan_status.setText(f"Connected to {result['ssid']} via {result['ap_name']} — {result['ip']}")
+    return True
+
+  def disconnect_wlan(self):
+    from modules.datacom_wlan import disconnect_station
+    conn = get_connection()
+    try: disconnect_station(conn, "admin", self.node_item.device_name)
+    finally: conn.close()
+    self.node_item.pc_config.update({"ip_address":"", "subnet_mask":"", "gateway":""})
+    self.node_item.update()
+    self.ip_address.clear(); self.subnet_mask.clear(); self.gateway.clear()
+    self.wlan_status.setText("Disconnected")
+    return True
 
   # ------------------------------------------------------------------ #
   # PPPoE client
@@ -199,6 +365,13 @@ class PCConfigDialog(QDialog):
     self.accept()
 
   def _find_path(self, start_node, target_node):
+    from modules.datacom_network import stp_blocked_link_keys, datacom_active_physical_link_keys
+    conn = get_connection()
+    try:
+      blocked_links = stp_blocked_link_keys(conn, "admin")
+      active_links = datacom_active_physical_link_keys(conn, "admin")
+    finally:
+      conn.close()
     if start_node is target_node:
       return True
     pending = [(start_node, None)]
@@ -209,6 +382,9 @@ class PCConfigDialog(QDialog):
         if not link.is_up:
           continue
         local_port = link.source_port if link.source_node is current else link.target_port
+        edge_key = tuple(sorted(((link.source_node.device_name, link.source_port), (link.target_node.device_name, link.target_port))))
+        if edge_key not in active_links or edge_key in blocked_links:
+          continue
         if "OTB" in current.device_type and incoming_port is not None:
           if incoming_port.startswith("IN-"):
             paired_port = "OUT-" + incoming_port[3:]
@@ -227,6 +403,49 @@ class PCConfigDialog(QDialog):
           visited.add(state)
           pending.append(state)
     return False
+
+  def _find_datacom_router(self, address, *, exact=False, endpoint=None):
+    """Find an active router interface that can serve as a routed PC gateway/edge."""
+    try:
+      target_ip = ipaddress.IPv4Address(address)
+    except ipaddress.AddressValueError:
+      return None
+    conn = get_connection()
+    try:
+      rows = conn.execute(
+          "SELECT node_name,device_type,running_json FROM olt_datacom_devices WHERE username=?",
+          ("admin",),
+      ).fetchall()
+    finally:
+      conn.close()
+    scene = self.node_item.scene()
+    if scene is None:
+      return None
+    topology_nodes = [item for item in scene.items() if isinstance(item, NetworkNodeItem)]
+    for name, kind, raw in rows:
+      if "router" not in (kind or "").lower():
+        continue
+      node_item = next((item for item in topology_nodes if item.device_name == name), None)
+      if node_item is None or (endpoint is not None and not self._find_path(endpoint, node_item)):
+        continue
+      try:
+        cfg = json.loads(raw)
+      except (TypeError, ValueError):
+        continue
+      for ifname, iface in (cfg.get("interfaces") or {}).items():
+        if not iface.get("ip") or iface.get("shutdown"):
+          continue
+        if exact:
+          matched = iface["ip"] == str(target_ip)
+        else:
+          try:
+            network = ipaddress.IPv4Network(f"{iface['ip']}/{iface.get('mask') or '255.255.255.0'}", strict=False)
+            matched = target_ip in network
+          except (ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+            matched = False
+        if matched:
+          return name, node_item, ifname
+    return None
 
   def _has_ont_olt_path(self):
     """Require an active simulated PC-to-ONT-to-OLT path before host probing."""
@@ -321,6 +540,18 @@ class PCConfigDialog(QDialog):
       conn.close()
       raise
 
+  def _vxlan_pc_reachable(self, destination_node, source_ip, destination_ip, gateway="", source_mask="", destination_mask=""):
+    """Try the HCIE VXLAN overlay when the PCs have no direct L2 cable path."""
+    conn = get_connection()
+    try:
+      from modules.datacom_vxlan import vxlan_pc_ping_reachable
+      return vxlan_pc_ping_reachable(conn, "admin", self.node_item.device_name,
+                                     destination_node.device_name, str(source_ip),
+                                     str(destination_ip), str(gateway or ""),
+                                     str(source_mask or ""), str(destination_mask or ""))
+    finally:
+      conn.close()
+
   def _check_ont_service_path(self, olt_node_name, vlan_id):
     """Require a service-port for the ONT connected to this PC on the gateway VLAN."""
     pc_links = [link for link in self.node_item.links if link.is_up]
@@ -412,6 +643,60 @@ class PCConfigDialog(QDialog):
     self.node_item.update()
     config = self.node_item.pc_config
 
+    wlan_conn = get_connection()
+    try:
+      from modules.datacom_wlan import station_info, station_ping
+      station = station_info(wlan_conn, "admin", self.node_item.device_name)
+      if station:
+        reachable = station_ping(wlan_conn, "admin", self.node_item.device_name, str(target_ip))
+        self.ping_output.setPlainText(
+            f"PING {destination} ({target_ip}) from {source}\n"
+            + ("Reply received through WLAN.\nSuccess: 1/1 packets received." if reachable
+               else "Request timed out.\nFailure: Destination is unreachable through the simulated WLAN topology.")
+        )
+        return bool(reachable)
+    finally:
+      wlan_conn.close()
+
+    lease_conn = get_connection()
+    try:
+      from modules.datacom_wlan import wired_pc_info
+      wired_lease = wired_pc_info(lease_conn, "admin", self.node_item.device_name)
+      if wired_lease:
+        reachable = str(target_ip) == config.get("gateway")
+        if not reachable:
+          rows = lease_conn.execute("SELECT node_name,running_json FROM olt_datacom_devices WHERE username=?", ("admin",)).fetchall()
+          owner = None
+          for device_name, raw in rows:
+            try:
+              device_cfg = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+              continue
+            if any(item.get("ip") == str(target_ip) for item in (device_cfg.get("interfaces") or {}).values()):
+              owner = device_name
+              break
+          if owner:
+            from modules.datacom_network import routed_ping_reachable
+            reachable = routed_ping_reachable(lease_conn, "admin", wired_lease["dhcp_node"], owner,
+                                               str(target_ip), source_address=str(source))
+          else:
+            pc_owner = next((item for item in self.node_item.scene().items()
+                             if isinstance(item, NetworkNodeItem) and item.device_type.lower() == "pc"
+                             and item.pc_config.get("ip_address") == str(target_ip)), None)
+            if pc_owner:
+              remote_gateway = pc_owner.pc_config.get("gateway", "")
+              router = self._find_datacom_router(remote_gateway, exact=True, endpoint=pc_owner) if remote_gateway else None
+              reachable = bool(router and routed_ping_reachable(lease_conn, "admin", wired_lease["dhcp_node"],
+                                                                  router[0], str(target_ip), source_address=str(source)))
+        output = f"PING {destination} ({target_ip}) from {source}\\n" + (
+            "Reply received through wired DHCP client.\\nSuccess: 1/1 packets received."
+            if reachable else "Request timed out.\\nFailure: Destination is unreachable through the simulated routed network.")
+        self.ping_output.setPlainText(output)
+        self._emit_ping_capture(destination, target_ip, reachable)
+        return bool(reachable)
+    finally:
+      lease_conn.close()
+
     reachable = False
     reason = "Destination is not present in the simulator topology."
     destination_node = None
@@ -426,7 +711,17 @@ class PCConfigDialog(QDialog):
         node_name, destination_vlan, remote_address, remote_mask = resolved
         remote_network = ipaddress.IPv4Network(f"{remote_address}/{remote_mask}", strict=False)
         if target_ip not in network and str(target_ip) != config.get("gateway"):
-          reason = "Destination is outside the local subnet; configure and test the gateway/route first."
+          gateway_router = self._find_datacom_router(config.get("gateway", ""), exact=True, endpoint=self.node_item) if gateway else None
+          if gateway_router:
+            route_conn = get_connection()
+            try:
+              from modules.datacom_network import routed_ping_reachable
+              reachable = routed_ping_reachable(route_conn, "admin", gateway_router[0], node_name, str(target_ip), source_address=str(source))
+            finally:
+              route_conn.close()
+            reason = "" if reachable else "No active direct or static route, or the return route is missing."
+          else:
+            reason = "Destination is outside the local subnet; configure a reachable router as the PC gateway."
         elif target_ip in network and remote_network != network:
           reason = "Destination interface subnet does not match this PC's local subnet."
         else:
@@ -447,12 +742,30 @@ class PCConfigDialog(QDialog):
           reason = "The destination PC has no valid IP configuration."
         else:
           if target_ip not in network or remote_network != network:
-            reason = "Destination PC is not in the same subnet; routed PC ping is unavailable."
+            reachable = self._vxlan_pc_reachable(resolved, source, target_ip, gateway,
+                config.get("subnet_mask", ""), remote_config.get("subnet_mask", ""))
+            if reachable:
+              reason = ""
+            else:
+              gateway_router = self._find_datacom_router(gateway, exact=True, endpoint=self.node_item) if gateway else None
+              destination_router = self._find_datacom_router(target_ip, endpoint=resolved)
+              if gateway_router and destination_router:
+                route_conn = get_connection()
+                try:
+                  from modules.datacom_network import routed_ping_reachable
+                  reachable = routed_ping_reachable(route_conn, "admin", gateway_router[0], destination_router[0], str(target_ip), source_address=str(source))
+                finally:
+                  route_conn.close()
+                reason = "" if reachable else "No active direct or static route, or the return route is missing."
+              else:
+                reason = "Configure an active router gateway and a route to the destination PC's subnet."
           elif self._find_path(self.node_item, resolved):
             reachable = True
             reason = ""
           else:
-            reason = "No active physical link path to the destination PC."
+            reachable = self._vxlan_pc_reachable(resolved, source, target_ip, gateway,
+                config.get("subnet_mask", ""), remote_config.get("subnet_mask", ""))
+            reason = "" if reachable else "No active physical or VXLAN path to the destination PC."
       elif target_ip.is_global:
         if not gateway:
           reason = "Configure the simulated PC's default gateway before testing internet access."

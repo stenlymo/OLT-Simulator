@@ -59,7 +59,15 @@ class OLTGraphicsView(QGraphicsView):
       device_type = event.mimeData().text()
       pos = self.mapToScene(event.position().toPoint())
       parent_window = self.window()
-      node_name = f"{device_type.split()[0]}_{len(parent_window.scene.items()) + 1}"
+      if "Router (eNSP-AR)" in device_type:
+        prefix = "Router"
+      elif "Switch (eNSP-LSW)" in device_type:
+        prefix = "Switch"
+      elif "Fit AP" in device_type:
+        prefix = "AP"
+      else:
+        prefix = device_type.split()[0]
+      node_name = f"{prefix}_{len(parent_window.scene.items()) + 1}"
       node_item = NetworkNodeItem(device_type, node_name, pos.x(), pos.y())
       parent_window.scene.addItem(node_item)
       parent_window.log_output.append(
@@ -88,6 +96,9 @@ class MainWindow(QMainWindow):
     self.setWindowTitle(
         "Huawei SmartAX OLT Network Simulator (Packet Tracer Mode)"
     )
+    from PyQt6.QtGui import QFont
+    from PyQt6.QtWidgets import QToolTip
+    QToolTip.setFont(QFont("Segoe UI", 10))
     self.resize(1280, 768)
     self.connecting_cable = False
     self.selected_src_node = None
@@ -141,6 +152,15 @@ class MainWindow(QMainWindow):
           if (new_ip, new_status) != (item.wan_ip, item.wan_status):
             item.wan_ip, item.wan_status = new_ip, new_status
             item.update()
+        elif "Fit AP" in item.device_type:
+          from modules.datacom_wlan import access_point_status
+          result = access_point_status(conn, "admin", item)
+          new_state, new_ip = result.get("state", "fault"), result.get("ip", "")
+          if (new_state, new_ip) != (item.ap_config.get("online_state"), item.ap_config.get("management_ip")):
+            item.ap_config.update({"online_state": new_state, "management_ip": new_ip,
+                                   "wac_name": result.get("wac", ""), "ap_id": result.get("ap_id", ""),
+                                   "ap_group": result.get("group", "default")})
+            item.update()
     finally:
       conn.close()
 
@@ -167,6 +187,9 @@ class MainWindow(QMainWindow):
     self.device_list = DraggableListWidget()
     self.device_list.addItems([
         "Core Router",
+        "Huawei Router (eNSP-AR)",
+        "Huawei Switch (eNSP-LSW)",
+        "Huawei Fit AP (AirEngine)",
         "Huawei OLT MA5801",
         "PC",
         "OTB (Optical Termination Box)",
@@ -214,6 +237,37 @@ class MainWindow(QMainWindow):
     self.console_dock.show()
     self.console_tabs.setCurrentWidget(terminal)
     terminal.terminal.setFocus()
+
+  def open_datacom_console(self, node_name, device_type):
+    from gui.dialogs.datacom_cli import DatacomTerminal
+
+    # The canvas is the active topology. Prune stale device configuration and
+    # links left behind by deleted/cleared nodes before a CLI command can use
+    # them for simulated reachability.
+    self._sync_topology_links()
+    terminal = self.cli_sessions.get(node_name)
+    if terminal is None:
+      terminal = DatacomTerminal(node_name, device_type, parent=self)
+      self.cli_sessions[node_name] = terminal
+      self.console_tabs.addTab(terminal, node_name)
+    self.console_dock.show()
+    self.console_tabs.setCurrentWidget(terminal)
+    terminal.terminal.setFocus()
+
+  def reset_datacom_device(self, node_name):
+    terminal = self.cli_sessions.pop(node_name, None)
+    if terminal is not None:
+      index = self.console_tabs.indexOf(terminal)
+      if index > 0:
+        self.console_tabs.removeTab(index)
+      terminal.deleteLater()
+    conn = get_connection()
+    try:
+      conn.execute("DELETE FROM olt_datacom_devices WHERE username=? AND node_name=?", ("admin", node_name))
+      conn.commit()
+    finally:
+      conn.close()
+    self.log_output.append(f"[INFO] {node_name} reset to factory defaults; first-login password setup is required.")
 
   def update_device_sysname(self, node_name, sysname):
     for item in self.scene.items():
@@ -322,7 +376,7 @@ class MainWindow(QMainWindow):
       for row in data.get("nodes", []):
         node = NetworkNodeItem(
             row["device_type"], row["device_name"], row["x"], row["y"],
-            row.get("pc_config"), row.get("display_name"),
+            row.get("pc_config"), row.get("display_name"), row.get("ap_config"),
         )
         node.local_ip = row.get("local_ip", "")
         node.wan_ip = row.get("wan_ip", "")
@@ -368,6 +422,8 @@ class MainWindow(QMainWindow):
     dev = node.device_type
     if dev.lower() == "pc":
       all_p = ["Ethernet0"]
+    elif "Fit AP" in dev:
+      all_p = ["GE0/0/0"]
     elif "Wireshark" in dev:
       all_p = ["Ethernet0"]
     elif "ONT" in dev and other_node.device_type.lower() == "pc":
@@ -377,6 +433,7 @@ class MainWindow(QMainWindow):
       uplink_peers = (
           "olt" in peer
           or "router" in peer
+          or "switch" in peer
           or "dhcp" in peer
           or "pppoe" in peer
           or "bras" in peer
@@ -389,6 +446,10 @@ class MainWindow(QMainWindow):
         all_p = [f"0/1/{i}" for i in range(16)]
     elif "Core Router" in dev:
       all_p = ["10GE-0/0/0", "10GE-0/0/1"]
+    elif "Router (eNSP-AR)" in dev:
+      all_p = [f"GE0/5/{i}" for i in range(8)] + [f"GE0/0/{i}" for i in range(4)]
+    elif "Switch (eNSP-LSW)" in dev:
+      all_p = [f"GE1/0/{i}" for i in range(1, 25)]
     elif "DHCP" in dev or "PPPoE" in dev or "BRAS" in dev:
       all_p = [f"GE-0/0/{i}" for i in range(4)]
     elif "OTB" in dev:
@@ -450,16 +511,26 @@ class MainWindow(QMainWindow):
           (src.device_type.lower() == "pc" and "OLT" in tgt.device_type)
           or (tgt.device_type.lower() == "pc" and "OLT" in src.device_type)
       )
+      is_datacom_pair = (
+          any(tag in src.device_type for tag in ("Router (eNSP-AR)", "Switch (eNSP-LSW)"))
+          and any(tag in tgt.device_type for tag in ("Router (eNSP-AR)", "Switch (eNSP-LSW)"))
+      )
       is_uplink = s_port.startswith("0/2/") or t_port.startswith("0/2/") or s_port.startswith("10GE-") or t_port.startswith("10GE-")
-      if is_pc_ont_link or is_pc_olt_link:
+      datacom_types = ("Router (eNSP-AR)", "Switch (eNSP-LSW)")
+      is_datacom_copper = (
+          not is_uplink
+          and (any(tag in src.device_type for tag in datacom_types)
+               or any(tag in tgt.device_type for tag in datacom_types))
+      )
+      if is_pc_ont_link or is_pc_olt_link or is_datacom_pair or is_datacom_copper:
         connection_type = "ethernet"
         fiber_type = "UTP"
         max_m = 100
       elif is_uplink:
         modules = list(OpticalLinkItem.SFP_PLUS_MODULES)
         sfp_module, ok3 = QInputDialog.getItem(
-            self, "10GE SFP+ Module",
-            "Select matching SFP+ modules and duplex TX/RX fiber:",
+            self, "OLT Uplink Transceiver",
+            "Select an optical duplex module or RJ-45 copper SFP+ (UTP):",
             modules, 0, False,
         )
         if not ok3:
@@ -468,6 +539,8 @@ class MainWindow(QMainWindow):
         optical = OpticalLinkItem.SFP_PLUS_MODULES[sfp_module]
         fiber_type = optical["fiber"]
         max_m = int(optical["reach_km"] * 1000)
+        if optical.get("media") == "copper":
+          connection_type = "ethernet"
       elif "OLT" in src.device_type or "OLT" in tgt.device_type:
         sfp, ok4 = QInputDialog.getItem(
             self,
@@ -484,11 +557,11 @@ class MainWindow(QMainWindow):
       else:
         max_m = 100000
 
-      if is_pc_ont_link or is_pc_olt_link:
+      if is_pc_ont_link or is_pc_olt_link or is_datacom_pair or is_datacom_copper:
         len_m = 5
       else:
         len_m, ok_distance = QInputDialog.getInt(
-            self, "Distance", f"Fiber distance in meters (maximum {max_m}):",
+            self, "Cable Length", f"Cable length in meters (maximum {max_m}):",
             min(500, max_m), 1, max_m, 10,
         )
         if not ok_distance:
@@ -521,9 +594,9 @@ class MainWindow(QMainWindow):
           self.log_output.append(
               f"[WARN] VLAN 20 belum dibuat; {olt_port} belum dijadikan access."
           )
-      elif is_uplink and (
-          "router" in src.device_type.lower()
-          or "router" in tgt.device_type.lower()
+      elif is_uplink and any(
+          tag.lower() in (src.device_type + " " + tgt.device_type).lower()
+          for tag in ("router", "switch")
       ):
         olt_node = src if "OLT" in src.device_type else tgt
         olt_port = s_port if olt_node is src else t_port
@@ -583,6 +656,10 @@ class MainWindow(QMainWindow):
     self.btn_connect.setChecked(False)
 
   def _sync_topology_links(self):
+    active_nodes = {
+        item.device_name for item in self.scene.items()
+        if isinstance(item, NetworkNodeItem)
+    }
     conn = get_connection()
     try:
       cursor = conn.cursor()
@@ -593,6 +670,14 @@ class MainWindow(QMainWindow):
           is_up INTEGER DEFAULT 1,
           PRIMARY KEY (username, source_node, source_port, target_node, target_port))""")
       cursor.execute("DELETE FROM olt_device_links WHERE username = 'admin'")
+      for (node_name,) in cursor.execute(
+          "SELECT node_name FROM olt_datacom_devices WHERE username = 'admin'"
+      ).fetchall():
+        if node_name not in active_nodes:
+          cursor.execute(
+              "DELETE FROM olt_datacom_devices WHERE username = 'admin' AND node_name = ?",
+              (node_name,),
+          )
       for item in self.scene.items():
         if not isinstance(item, OpticalLinkItem):
           continue
@@ -607,6 +692,14 @@ class MainWindow(QMainWindow):
       conn.commit()
     finally:
       conn.close()
+    for node_name, terminal in list(self.cli_sessions.items()):
+      if node_name in active_nodes:
+        continue
+      self.cli_sessions.pop(node_name, None)
+      tab_index = self.console_tabs.indexOf(terminal)
+      if tab_index > 0:
+        self.console_tabs.removeTab(tab_index)
+      terminal.deleteLater()
 
   def delete_selected_item(self):
     for item in self.scene.selectedItems():

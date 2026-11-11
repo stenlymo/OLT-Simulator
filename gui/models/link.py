@@ -1,6 +1,6 @@
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QPainterPath, QPainterPathStroker, QPen
-from PyQt6.QtWidgets import QGraphicsItem, QGraphicsLineItem
+from PyQt6.QtGui import QColor, QFont, QPainterPath, QPainterPathStroker, QPen
+from PyQt6.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem
 
 
 class OpticalLinkItem(QGraphicsLineItem):
@@ -24,6 +24,16 @@ class OpticalLinkItem(QGraphicsLineItem):
           "fiber": "MMF", "reach_km": 0.3, "tx_min_dbm": -7.3,
           "rx_sensitivity_dbm": -9.9, "fiber_loss_db_km": 2.5,
           "wavelength_nm": 850, "rate_gbps": 10,
+      },
+      "SFP+ 10GBASE-T RJ-45 copper (UTP, 30 m)": {
+          "fiber": "UTP", "reach_km": 0.03, "tx_min_dbm": 0.0,
+          "rx_sensitivity_dbm": 0.0, "fiber_loss_db_km": 0.0,
+          "wavelength_nm": None, "rate_gbps": 10, "media": "copper",
+      },
+      "GE 1000BASE-T RJ-45 SFP copper (UTP, 100 m)": {
+          "fiber": "UTP", "reach_km": 0.1, "tx_min_dbm": 0.0,
+          "rx_sensitivity_dbm": 0.0, "fiber_loss_db_km": 0.0,
+          "wavelength_nm": None, "rate_gbps": 1, "media": "copper",
       },
   }
 
@@ -52,18 +62,63 @@ class OpticalLinkItem(QGraphicsLineItem):
     self.fiber_type = fiber_type
     self.connection_type = connection_type
 
+    self.info_label = QGraphicsTextItem(self)
+    self.info_label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+    self.info_label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+    self.info_label.setZValue(5)
+    self.info_label.setDefaultTextColor(QColor("#f5f7fa"))
+    self.info_label.setFont(QFont("Segoe UI", 9))
+    self.info_label.setTextWidth(370)
+    self.info_label.setVisible(False)
+
     self.is_los = False
     self.blink_state = True
 
     self.source_node.add_link(self)
     self.target_node.add_link(self)
     self.update_position()
+    # Adding a second cable between the same devices changes the lane offsets
+    # of every parallel cable, so refresh those existing graphics items too.
+    for link in tuple(self.source_node.links):
+      if link is not self and link._same_device_pair(self):
+        link.update_position()
+
+  def _same_device_pair(self, other):
+    return ((self.source_node is other.source_node and self.target_node is other.target_node)
+            or (self.source_node is other.target_node and self.target_node is other.source_node))
+
+  def _parallel_offset(self):
+    siblings = [link for link in self.source_node.links if self._same_device_pair(link)]
+    if len(siblings) <= 1:
+      return 0.0
+
+    def port_key(link):
+      if link.source_node.device_name <= link.target_node.device_name:
+        return (link.source_port, link.target_port)
+      return (link.target_port, link.source_port)
+
+    siblings.sort(key=port_key)
+    lane = siblings.index(self) - (len(siblings) - 1) / 2
+    return lane * 12.0
 
   def update_position(self):
     src_center = self.source_node.get_center_pos()
     tgt_center = self.target_node.get_center_pos()
+    dx = tgt_center.x() - src_center.x()
+    dy = tgt_center.y() - src_center.y()
+    length = max((dx * dx + dy * dy) ** 0.5, 1.0)
+    # Use the same perpendicular direction for both cable directions. This
+    # keeps lanes stable even when the user creates a reverse-oriented link.
+    if self.source_node.device_name <= self.target_node.device_name:
+      normal_x, normal_y = -dy / length, dx / length
+    else:
+      normal_x, normal_y = dy / length, -dx / length
+    offset = self._parallel_offset()
     self.setLine(
-        src_center.x(), src_center.y(), tgt_center.x(), tgt_center.y()
+        src_center.x() + normal_x * offset,
+        src_center.y() + normal_y * offset,
+        tgt_center.x() + normal_x * offset,
+        tgt_center.y() + normal_y * offset,
     )
     self.calculate_attenuation()
 
@@ -76,13 +131,51 @@ class OpticalLinkItem(QGraphicsLineItem):
     if self.connection_type == "ethernet":
       self.rx_power = 0.0
       self.total_loss = 0.0
-      self.is_los = False
+      copper_sfp = self.SFP_PLUS_MODULES.get(self.sfp_module, {}).get("media") == "copper"
+      reach_ok = not copper_sfp or self.length_km <= self.SFP_PLUS_MODULES[self.sfp_module]["reach_km"]
+      rate_ok = True
+      negotiated_rate = None
+      if copper_sfp:
+        olt_node, olt_port = next(((node, port) for node, port in
+                                  ((self.source_node, self.source_port), (self.target_node, self.target_port))
+                                  if "OLT" in node.device_type and port.startswith("0/2/")), (None, None))
+        peer_node = self.target_node if olt_node is self.source_node else self.source_node
+        peer_max = 10000 if "OLT" in getattr(peer_node, "device_type", "") or "Core Router" in getattr(peer_node, "device_type", "") else 1000
+        settings = None
+        if olt_node:
+          try:
+            from modules.database import get_connection
+            board, port_id = olt_port.rsplit("/", 1)[0], int(olt_port.rsplit("/", 1)[1])
+            conn = get_connection()
+            settings = conn.execute("SELECT speed,auto_neg FROM olt_eth_port_settings WHERE username=? AND node_name=? AND board=? AND port_id=?",
+                                    ("admin", olt_node.device_name, board, port_id)).fetchone()
+            conn.close()
+          except Exception:
+            settings = None
+        if settings:
+          speed, auto_neg = settings
+          if auto_neg and speed is None:
+            negotiated_rate = min(int(self.SFP_PLUS_MODULES[self.sfp_module]["rate_gbps"] * 1000), peer_max)
+          else:
+            negotiated_rate = int(speed or 10000)
+            module_max = int(self.SFP_PLUS_MODULES[self.sfp_module]["rate_gbps"] * 1000)
+            rate_ok = negotiated_rate <= min(peer_max, module_max)
+        else:
+          negotiated_rate = min(int(self.SFP_PLUS_MODULES[self.sfp_module]["rate_gbps"] * 1000), peer_max)
+      self.is_los = not reach_ok or not rate_ok
       self.is_up = True
+      self.is_up = not self.is_los
       self.update_pen_style()
-      self.setToolTip(
-          f"Ethernet cable: {self.source_node.device_name} ({self.source_port})"
-          f" <---> {self.target_node.device_name} ({self.target_port})\n"
-          f"Length: {self.length_km * 1000:.0f} m; simulated link: UP"
+      detail = "UTP copper"
+      if copper_sfp:
+        detail += f" | {self.sfp_module} | negotiated/configured {negotiated_rate or 1000} Mbit/s"
+        if not reach_ok:
+          detail += " | copper reach exceeded (30 m max)"
+        elif not rate_ok:
+          detail += f" | speed mismatch with peer ({peer_max} Mbit/s maximum)"
+      self._set_connection_information(
+          "Ethernet cable", "UTP copper", "Simulated link: UP" if self.is_up else "Simulated link: DOWN",
+          detail + " | 0 dB loss"
       )
       return
     optical = self.SFP_PLUS_MODULES.get(self.sfp_module)
@@ -116,19 +209,52 @@ class OpticalLinkItem(QGraphicsLineItem):
     self.is_up = not self.is_los
 
     self.update_pen_style()
-    self.setToolTip(
-        f"Link Segment: {self.source_node.device_name} ({self.source_port})"
-        f" <---> {self.target_node.device_name} ({self.target_port})\nDistance:"
-        f" {self.length_km:.3f} km ({self.length_km*1000:.0f} m)\nFiber Loss:"
-        f" -{fiber_loss:.2f} dB | Component Loss: -{extra_loss:.2f}"
-        f" dB\nCalculated Segment Rx: {self.rx_power:.2f} dBm"
-        + (f"\nSFP+: {self.sfp_module}\nFiber: {self.fiber_type}; "
-           f"{optical['rate_gbps']} Gbit/s, LC, {optical['wavelength_nm']} nm; "
-           f"reach: {optical['reach_km']:.1f} km; Tx min: {optical['tx_min_dbm']:.1f} dBm; "
-           f"Rx sensitivity: {optical['rx_sensitivity_dbm']:.1f} dBm" if optical else "")
+    detail = (
+        f"Distance: {self.length_km:.3f} km ({self.length_km * 1000:.0f} m)"
+        f" | Fiber loss: -{fiber_loss:.2f} dB"
+        f" | Component loss: -{extra_loss:.2f} dB"
+        f" | Segment Rx: {self.rx_power:.2f} dBm"
+    )
+    if optical:
+      detail += (
+          f" | SFP+: {self.sfp_module}"
+          f" | {self.fiber_type}, {optical['rate_gbps']} Gbit/s, "
+          f"{optical['wavelength_nm']} nm, reach {optical['reach_km']:.1f} km"
+      )
+    self._set_connection_information(
+        "Fiber connection", self.fiber_type, "UP" if self.is_up else "LOS", detail
     )
 
+  def _set_connection_information(self, title, medium, status, detail):
+    self.setToolTip(
+        f"<b>{title}</b><br>"
+        f"<b>{self.source_node.device_name}</b> ({self.source_port})"
+        f" &harr; <b>{self.target_node.device_name}</b> ({self.target_port})<br>"
+        f"Cable: {medium} &nbsp; | &nbsp; Length: {self.length_km * 1000:.0f} m"
+        f" &nbsp; | &nbsp; Status: {status}<br>{detail}"
+    )
+    self.info_label.setHtml(
+        "<div style='background-color:#17212b; border:1px solid #8aa0b5; "
+        "border-radius:5px; padding:6px 8px; color:#f5f7fa;'>"
+        f"<b>{title}</b><br>"
+        f"{self.source_node.device_name} ({self.source_port})"
+        f" &harr; {self.target_node.device_name} ({self.target_port})<br>"
+        f"{medium} &nbsp; | &nbsp; {self.length_km * 1000:.0f} m"
+        f" &nbsp; | &nbsp; {status}<br>{detail}</div>"
+    )
+    self.info_label.setTextWidth(370)
+    self.info_label.setVisible(self.isSelected())
+    line = self.line()
+    center_x = (line.x1() + line.x2()) / 2
+    bottom_y = max(
+        self.source_node.pos().y() + self.source_node.height,
+        self.target_node.pos().y() + self.target_node.height,
+    )
+    self.info_label.setPos(center_x - 185, bottom_y + 10)
+
   def update_pen_style(self):
+    if hasattr(self, "info_label"):
+      self.info_label.setVisible(self.isSelected())
     if self.isSelected():
       pen = QPen(QColor("#00e5ff"), 4, Qt.PenStyle.SolidLine)
     elif self.is_los:
@@ -159,9 +285,13 @@ class OpticalLinkItem(QGraphicsLineItem):
       self.update_pen_style()
 
   def detach(self):
+    peers = [link for link in self.source_node.links
+             if link is not self and self._same_device_pair(link)]
     for node in (self.source_node, self.target_node):
       if self in node.links:
         node.links.remove(self)
+    for link in peers:
+      link.update_position()
 
   def to_dict(self):
     return {

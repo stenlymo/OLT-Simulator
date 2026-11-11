@@ -4,7 +4,13 @@ import json
 from datetime import datetime, timezone
 
 # Bisa diarahkan ke database lain lewat variabel lingkungan (mis. untuk API/test)
-DB_NAME = os.environ.get("OLT_DB_NAME", "olt_simulator.db")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_configured_db_name = os.environ.get("OLT_DB_NAME")
+if _configured_db_name:
+  DB_NAME = (_configured_db_name if os.path.isabs(_configured_db_name)
+             else os.path.join(PROJECT_ROOT, _configured_db_name))
+else:
+  DB_NAME = os.path.join(PROJECT_ROOT, "olt_simulator.db")
 
 # List 22 Serial Number ONT Alcatel-Lucent / Nokia Format
 ONT_SN_POOL = [
@@ -29,6 +35,11 @@ def _capture_user_configuration(cursor, username):
       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'olt_%' ORDER BY name"
   ).fetchall()
   for (table_name,) in tables:
+    # The topology catalog is the index of saved topologies, not device
+    # configuration. Including it in snapshots can restore an old catalog
+    # and make newer saved topologies disappear during load.
+    if table_name in ("olt_topologies", "olt_saved_configurations"):
+      continue
     columns = [row[1] for row in cursor.execute(f'PRAGMA table_info("{table_name}")')]
     if "username" not in columns:
       continue
@@ -61,6 +72,8 @@ def restore_user_configuration(cursor, username, snapshot):
   """Replace one user's OLT rows from a topology snapshot, preserving other users."""
   for table_name, rows in snapshot.items():
     if not table_name.startswith("olt_"):
+      continue
+    if table_name in ("olt_topologies", "olt_saved_configurations"):
       continue
     exists = cursor.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table_name,)
@@ -659,6 +672,14 @@ def init_db():
             PRIMARY KEY (username, hostname)
         )
     """)
+
+  cursor.execute("""CREATE TABLE IF NOT EXISTS olt_datacom_devices (
+      username TEXT NOT NULL, node_name TEXT NOT NULL, device_type TEXT NOT NULL,
+      password_salt TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL DEFAULT '',
+      sysname TEXT NOT NULL DEFAULT 'HUAWEI', running_json TEXT NOT NULL,
+      saved_json TEXT NOT NULL DEFAULT '', files_json TEXT NOT NULL DEFAULT '{}',
+      startup_file TEXT NOT NULL DEFAULT '', boot_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(username,node_name))""")
 
   # Populate Pool Serial Number ONT jika belum ada
   for sn in ONT_SN_POOL:
